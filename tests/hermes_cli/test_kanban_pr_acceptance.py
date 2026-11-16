@@ -213,6 +213,39 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
 
 # --- #122689: acceptance must read the repo as the ASSIGNEE profile's gh login ---
 
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("status", ["ready", "review"])
+@pytest.mark.parametrize("change", ["none", "reassign", "aba"])
+def test_acceptance_fences_assignee_changes(github, monkeypatch, status, change):
+    from hermes_cli import kanban_pr_acceptance
+
+    resolved = []
+    monkeypatch.setattr(kanban_pr_acceptance, "_assignee_profile_home",
+                        lambda name: resolved.append(name) or None)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="assignee race", assignee="first",
+                             completion_contract="acme/repo")
+        if status == "review":
+            assert kb.request_review(conn, tid, summary="review", reviewer="first")
+
+        def reassign():
+            with connect() as rival:
+                assert kb.assign_task(rival, tid, "second")
+                if change == "aba":
+                    assert kb.assign_task(rival, tid, "first")
+
+        if change != "none":
+            github["race"] = reassign
+        assert kb.complete_task(conn, tid, result="done", metadata={
+            "published_pr": "https://github.com/acme/repo/pull/7"}) is (change == "none")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == ("done" if change == "none" else status)
+        assert task.assignee == ("second" if change == "reassign" else "first")
+        assert resolved == ["first"]
+        if change != "none":
+            assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0] == 0
+
 @pytest.mark.platforms("posix")
 def test_acceptance_runs_gh_as_the_assignee_profile(tmp_path, monkeypatch):
     """The gh child env carries the assignee's own GH credentials (its .env),

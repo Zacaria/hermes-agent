@@ -6,7 +6,13 @@ from hermes_cli.kanban_pr_acceptance import _PR, collect_acceptance
 
 
 def _snapshot(conn, task_id):
-    row = conn.execute("SELECT current_run_id, status, completion_contract FROM tasks WHERE id=?", (task_id,)).fetchone()
+    # Lifecycle assignment writes append an event in the same transaction.
+    # Its monotonic id fences an A -> B -> A handoff as well as a changed name.
+    row = conn.execute(
+        "SELECT current_run_id, status, completion_contract, assignee, "
+        "(SELECT MAX(id) FROM task_events WHERE task_id=tasks.id) "
+        "FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
     return tuple(row) if row else None
 
 
@@ -14,7 +20,7 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
     snapshot = _snapshot(conn, task_id)
     if snapshot is None:
         return False
-    run_id, status, contract = snapshot
+    run_id, status, contract, assignee, event_id = snapshot
     if not contract or contract == "local-only":
         return None
     if status not in {"running", "ready", "blocked", "review"} or (expected_run_id is not None and run_id != expected_run_id):
@@ -27,11 +33,9 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
             if _snapshot(conn, task_id) != snapshot:
                 return False
             conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
-        snapshot = (run_id, status, published_pr)
+        snapshot = (run_id, status, published_pr, assignee, event_id)
         contract = published_pr
-    # The assignee profile's gh login owns the repo: acceptance must not run as
-    # the ambient login of whichever process completes the card (#122689).
-    assignee = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()["assignee"]
+    # Assigned tasks use the assignee's gh login, not the caller's (#122689).
     from pathlib import Path
     db_file = conn.execute("PRAGMA database_list").fetchone()[2]
     if not db_file:

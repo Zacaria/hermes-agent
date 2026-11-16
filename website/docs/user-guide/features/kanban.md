@@ -64,6 +64,8 @@ required checks. Missing, pending, failed, cancelled, timed-out, stale, skipped 
 neutral **required** evidence cannot complete the card. Neither can zero-run
 acceptance, unreadable policy or GitHub API failures. A repository without required
 checks needs a local-only contract unless an operator configures trusted checks.
+Acceptance uses the assignee's GitHub identity when assigned. If its assignment or lifecycle changes during evidence collection, completion is refused; retry against the current task.
+
 For PR contracts, an operator creates `pr-acceptance-policy.yaml` beside the selected board database and pins repository checks there. This board-owned file is required even if GitHub protection is configured; a missing or unreadable file refuses completion. It is read as a local file regardless of the caller's config backend:
 
 ```yaml
