@@ -23,7 +23,7 @@ def github(tmp_path, monkeypatch):
                 value = {"data": {"repository": {"pullRequest": {
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                        {"context": "required", "app": {"databaseId": 1}}] if not state.get("unprotected") else []}}}}}}
             elif "/rules/branches/" in self.path:
                 if state.get("rules_error"):
                     self.send_response(403)
@@ -33,7 +33,7 @@ def github(tmp_path, monkeypatch):
                 value = [[]]
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
-                       "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
+                       "app": {"id": state.get("app_id", 1)}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
                        "html_url": "https://github.com/acme/repo/actions/runs/42"}
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
@@ -89,7 +89,7 @@ def test_trusted_check_allows_only_specific_plan_refusal(github, tmp_path, monke
     monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: home)
     config = home / "config.yaml"
     config.write_text("kanban:\n  pr_required_checks:\n    acme/repo:\n      - context: required\n        app_id: 1\n")
-    github["rules_error"] = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+    github.update(rules_error="Upgrade to GitHub Pro or make this repository public to enable this feature.", unprotected=True)
     with connect() as conn:
         for fault in (None, "missing", "stale", "head_change", "failure", "pending"):
             github.update(head="a" * 40, conclusion=fault if fault in ("failure", "pending") else "success")
@@ -99,6 +99,19 @@ def test_trusted_check_allows_only_specific_plan_refusal(github, tmp_path, monke
             assert kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"}) is (fault is None)
             if fault in ("missing", "stale", "head_change"):
                 github.pop(fault)
+        github.update(head="a" * 40, conclusion="success", app_id=2)
+        tid = kb.create_task(conn, title="wrong app", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        github.pop("app_id")
+        github["race"] = lambda: config.write_text("kanban: {}\n")
+        tid = kb.create_task(conn, title="policy changed", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        github.pop("race")
+        github["unprotected"] = False
+        config.write_text("kanban:\n  pr_required_checks:\n    acme/repo:\n      - context: different\n        app_id: 1\n")
+        tid = kb.create_task(conn, title="both policies apply", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        config.write_text("kanban:\n  pr_required_checks:\n    acme/repo:\n      - context: required\n        app_id: 1\n")
         github["rules_error"] = "Resource not accessible by integration"
         tid = kb.create_task(conn, title="denied", completion_contract="acme/repo")
         assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})

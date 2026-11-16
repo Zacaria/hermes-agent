@@ -44,6 +44,9 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
         # or missing grant), not a transient API failure. Persist only the status
         # code + endpoint, never gh's stderr (credentials/host details).
         denied = re.search(r"HTTP (40[134])", exc.stderr or "")
+        if (denied and denied[1] == "403" and "/rules/branches/" in endpoint
+                and "Upgrade to GitHub Pro or make this repository public to enable this feature." in (exc.stderr or "")):
+            raise _RulesPlanError("Rules API unavailable on this GitHub plan") from None
         if denied:
             raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
         if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
@@ -59,6 +62,34 @@ class _GateAuthError(RuntimeError):
     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
     this profile's login cannot see the repo — an identity problem to fix, not
     an infrastructure blip to retry."""
+
+
+class _RulesPlanError(_GateAuthError):
+    """GitHub explicitly reports that branch rules require a paid plan."""
+
+
+def _trusted_checks(repo: str) -> set[tuple[str, int]]:
+    from hermes_cli.config_backend import read_config_doc
+    from hermes_cli.profiles import _get_default_hermes_home
+
+    path = _get_default_hermes_home() / "config.yaml"
+    try:
+        config = read_config_doc(path)
+        entries = (config or {}).get("kanban", {}).get("pr_required_checks", {}).get(repo, [])
+        if not isinstance(entries, list):
+            raise ValueError("Invalid trusted check policy")
+        checks = set()
+        for entry in entries:
+            if (not isinstance(entry, dict) or set(entry) != {"context", "app_id"}
+                    or not isinstance(entry["context"], str) or not entry["context"].strip()
+                    or type(entry["app_id"]) is not int or entry["app_id"] <= 0):
+                raise ValueError("Invalid trusted check policy")
+            checks.add((entry["context"], entry["app_id"]))
+        return checks
+    except FileNotFoundError:
+        return set()
+    except Exception as exc:
+        raise ValueError("Cannot read trusted check policy") from exc
 
 
 def _gh_env(profile_home: str | None) -> dict[str, str] | None:
@@ -133,8 +164,15 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        trusted = _trusted_checks(repo)
+        required.update(trusted)
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home)
+        except _RulesPlanError:
+            if not trusted:
+                raise
+            rules = []
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
@@ -174,6 +212,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
+            return receipt
+        if _trusted_checks(repo) != trusted:
+            receipt.update(classification="stale", detail="Trusted check policy changed while collecting evidence; retry.")
             return receipt
         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
         receipt["ok"] = receipt["classification"] == "success"
