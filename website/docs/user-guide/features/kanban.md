@@ -64,7 +64,7 @@ required checks. Missing, pending, failed, cancelled, timed-out, stale, skipped 
 neutral **required** evidence cannot complete the card. Neither can zero-run
 acceptance, unreadable policy or GitHub API failures. A repository without required
 checks needs a local-only contract unless an operator configures trusted checks.
-In the default profile's `config.yaml`, an operator may pin repository checks:
+For PR contracts, an operator creates `pr-acceptance-policy.yaml` beside the selected board database and pins repository checks there. This board-owned file is required even if GitHub protection is configured; a missing or unreadable file refuses completion. It is read as a local file regardless of the caller's config backend:
 
 ```yaml
 kanban:
@@ -77,8 +77,11 @@ kanban:
 This policy is independent of task metadata and adds to available GitHub protection
 requirements. Only GitHub's specific paid-plan rules API refusal permits continuing
 without ruleset data, and only with a nonempty pinned policy for that repository.
-Other access errors still fail closed. Protect the default profile configuration from
-untrusted writers; it defines acceptance authority. `gh` must be authenticated with read access to
+Other access errors still fail closed. Policy follows the database actually opened by the native
+connection, not the caller's home, profile, task metadata or configuration backend. An operator
+must place the policy alongside each board database, including boards in custom homes. This is a
+single-user lifecycle guard, not isolation from someone who can directly modify the board, policy,
+or validator as the same OS user. `gh` must be authenticated with read access to
 the repository's checks and rules; no remote writes are performed by this gate.
 Acceptance reads run as the **assignee profile's** `gh` login — its `GH_TOKEN` /
 `GH_CONFIG_DIR` from the profile's own `.env`, never the ambient login of the

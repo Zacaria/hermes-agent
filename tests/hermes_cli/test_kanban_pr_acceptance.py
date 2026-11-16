@@ -32,7 +32,7 @@ def github(tmp_path, monkeypatch):
                     return
                 value = [[]]
             elif "/check-runs" in self.path:
-                run = {"id": 42, "name": "required", "head_sha": sha,
+                run = {"id": 42, "name": state.get("check_name", "required"), "head_sha": sha,
                        "app": {"id": state.get("app_id", 1)}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
                        "html_url": "https://github.com/acme/repo/actions/runs/42"}
                 if state.get("stale"):
@@ -73,6 +73,7 @@ def github(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     kb.init_db()
+    (kb.kanban_db_path().parent / "pr-acceptance-policy.yaml").write_text("kanban: {}\n")
     try:
         yield state
     finally:
@@ -82,12 +83,42 @@ def github(tmp_path, monkeypatch):
 
 
 @pytest.mark.platforms("linux")
+@pytest.mark.parametrize("backend", ["file", "unsupported-test-backend"])
+def test_pinned_board_rejects_caller_selected_policy(github, tmp_path, monkeypatch, backend):
+    board = kb.kanban_db_path()
+    policy = board.parent / "pr-acceptance-policy.yaml"
+    policy.write_text("kanban:\n  pr_required_checks:\n    acme/repo:\n      - context: linux\n        app_id: 1\n")
+    spoof = tmp_path / "spoof"
+    spoof.mkdir()
+    (spoof / "config.yaml").write_text("kanban:\n  pr_required_checks:\n    acme/repo:\n      - context: attacker\n        app_id: 1\n")
+    with connect() as conn:
+        tid = kb.create_task(conn, title="spoof", completion_contract="acme/repo")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(board))
+    monkeypatch.setenv("HERMES_HOME", str(spoof / "profiles" / "caller"))
+    monkeypatch.setenv("HOME", str(spoof))
+    monkeypatch.setenv("HERMES_CONFIG_BACKEND", backend)
+    github.update(rules_error="Upgrade to GitHub Pro or make this repository public to enable this feature.", unprotected=True, check_name="attacker")
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+    try:
+        with connect() as conn:
+            assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7", "pr_required_checks": [{"context": "attacker", "app_id": 1}]})
+    except ConfigBackendUnavailable:
+        assert backend != "file"
+    monkeypatch.setenv("HERMES_CONFIG_BACKEND", "file")
+    with connect(board) as conn:
+        assert kb.get_task(conn, tid).status != "done"
+        row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()
+        if row:
+            receipt = json.loads(row[0])
+            assert receipt["required"] == [{"context": "linux", "app_id": 1}]
+            assert receipt["classification"] == "missing"
+        else:
+            assert backend != "file"
+
+
+@pytest.mark.platforms("linux")
 def test_trusted_check_allows_only_specific_plan_refusal(github, tmp_path, monkeypatch):
-    from hermes_cli import profiles
-    home = tmp_path / "owner"
-    home.mkdir()
-    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: home)
-    config = home / "config.yaml"
+    config = kb.kanban_db_path().parent / "pr-acceptance-policy.yaml"
     config.write_text("kanban:\n  pr_required_checks:\n    acme/repo:\n      - context: required\n        app_id: 1\n")
     github.update(rules_error="Upgrade to GitHub Pro or make this repository public to enable this feature.", unprotected=True)
     with connect() as conn:
@@ -116,6 +147,9 @@ def test_trusted_check_allows_only_specific_plan_refusal(github, tmp_path, monke
         tid = kb.create_task(conn, title="denied", completion_contract="acme/repo")
         assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
         github["rules_error"] = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+        config.unlink()
+        tid = kb.create_task(conn, title="missing policy", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
         config.write_text("kanban: {}\n")
         tid = kb.create_task(conn, title="no trusted policy", completion_contract="acme/repo")
         assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})

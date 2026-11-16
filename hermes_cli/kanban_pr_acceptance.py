@@ -68,13 +68,11 @@ class _RulesPlanError(_GateAuthError):
     """GitHub explicitly reports that branch rules require a paid plan."""
 
 
-def _trusted_checks(repo: str) -> set[tuple[str, int]]:
-    from hermes_cli.config_backend import read_config_doc
-    from hermes_cli.profiles import _get_default_hermes_home
+def _trusted_checks(repo: str, path: Path) -> set[tuple[str, int]]:
+    from hermes_cli.config_backend import FileBackend
 
-    path = _get_default_hermes_home() / "config.yaml"
     try:
-        config = read_config_doc(path)
+        config = FileBackend.read_path(path)
         entries = (config or {}).get("kanban", {}).get("pr_required_checks", {}).get(repo, [])
         if not isinstance(entries, list):
             raise ValueError("Invalid trusted check policy")
@@ -86,8 +84,6 @@ def _trusted_checks(repo: str) -> set[tuple[str, int]]:
                 raise ValueError("Invalid trusted check policy")
             checks.add((entry["context"], entry["app_id"]))
         return checks
-    except FileNotFoundError:
-        return set()
     except Exception as exc:
         raise ValueError("Cannot read trusted check policy") from exc
 
@@ -136,7 +132,7 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
 
 
 def collect_acceptance(contract: str, published_pr: str | None,
-                       assignee: str | None = None) -> dict:
+                       assignee: str | None = None, *, policy_path: Path) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
                "pr_url": published_pr, "checks": [],
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
@@ -164,7 +160,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        trusted = _trusted_checks(repo)
+        trusted = _trusted_checks(repo, policy_path)
         required.update(trusted)
         try:
             rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
@@ -213,7 +209,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
             return receipt
-        if _trusted_checks(repo) != trusted:
+        if _trusted_checks(repo, policy_path) != trusted:
             receipt.update(classification="stale", detail="Trusted check policy changed while collecting evidence; retry.")
             return receipt
         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
