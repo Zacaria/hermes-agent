@@ -25,6 +25,11 @@ def github(tmp_path, monkeypatch):
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
                         {"context": "required", "app": {"databaseId": 1}}]}}}}}}
             elif "/rules/branches/" in self.path:
+                if state.get("rules_error"):
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(state["rules_error"].encode())
+                    return
                 value = [[]]
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
@@ -60,9 +65,10 @@ def github(tmp_path, monkeypatch):
     shim = tmp_path / "bin"
     shim.mkdir()
     gh = shim / "gh"
-    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request\n"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
-                  "print(urllib.request.urlopen(u).read().decode())\n")
+                  "try:\n print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n print(e.read().decode() + ' (HTTP ' + str(e.code) + ')', file=sys.stderr); sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -73,6 +79,33 @@ def github(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.mark.platforms("linux")
+def test_trusted_check_allows_only_specific_plan_refusal(github, tmp_path, monkeypatch):
+    from hermes_cli import profiles
+    home = tmp_path / "owner"
+    home.mkdir()
+    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: home)
+    config = home / "config.yaml"
+    config.write_text("kanban:\n  pr_required_checks:\n    acme/repo:\n      - context: required\n        app_id: 1\n")
+    github["rules_error"] = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+    with connect() as conn:
+        for fault in (None, "missing", "stale", "head_change", "failure", "pending"):
+            github.update(head="a" * 40, conclusion=fault if fault in ("failure", "pending") else "success")
+            if fault in ("missing", "stale", "head_change"):
+                github[fault] = True
+            tid = kb.create_task(conn, title="trusted", completion_contract="acme/repo")
+            assert kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"}) is (fault is None)
+            if fault in ("missing", "stale", "head_change"):
+                github.pop(fault)
+        github["rules_error"] = "Resource not accessible by integration"
+        tid = kb.create_task(conn, title="denied", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        github["rules_error"] = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+        config.write_text("kanban: {}\n")
+        tid = kb.create_task(conn, title="no trusted policy", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
 
 
 @pytest.mark.platforms("linux")
